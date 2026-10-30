@@ -1,5 +1,6 @@
 import logging
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from backend.app.core.config import settings
 from backend.app.api.routes import webhook
 
@@ -13,6 +14,15 @@ app = FastAPI(
     title="Munim AI Backend",
     description="WhatsApp Assistant & Self-updating Ledger for Small Sellers",
     version="1.0.0"
+)
+
+# Enable CORS for local testing & dashboard integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Include webhook route
@@ -29,4 +39,3 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("backend.app.main:app", host="0.0.0.0", port=8000, reload=True)
-
