@@ -43,7 +43,7 @@ async def send_whatsapp_message(to_phone: str, text: str) -> dict:
             else:
                 logger.info(f"WhatsApp message sent to {clean_phone}: {response_data}")
             return response_data
-    except Exception as e:
+    except (httpx.HTTPError, ValueError, TypeError) as e:
         logger.error(f"Failed to send WhatsApp message to {clean_phone}: {e}")
         return {"error": str(e)}
 
