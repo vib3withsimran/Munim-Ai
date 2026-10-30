@@ -1,268 +1,246 @@
-import os
 import json
-import uuid
 import logging
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import Optional, List, Dict, Any
 
-import gspread
-from google.oauth2.service_account import Credentials
+import httpx
+
 from backend.app.core.config import settings
-from backend.app.models.schemas import ExtractedMessage
+from backend.app.models.schemas import ExtractedMessage, OrderItem, ConfidenceScore
 
 logger = logging.getLogger(__name__)
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
+SYSTEM_PROMPT = """
+You are 'Munim AI', an expert business assistant and accountant for small Indian home sellers (e.g., kurti/clothing, bakery, jewellery).
+Your job is to read customer messages (in English, Hindi, or Hinglish) and return a strictly structured JSON object.
 
-TAB_HEADERS = {
-    "Customers": ["phone", "name", "status", "last_seen", "total_due", "created_at"],
-    "Orders": ["order_id", "customer_phone", "items_json", "items_readable", "amount", "amount_paid", "amount_due", "delivery_address", "status", "created_at", "updated_at"],
-    "Payments": ["payment_id", "order_id", "customer_phone", "amount", "method", "upi_txn_id", "screenshot_url", "verified", "created_at"],
-    "Catalog": ["product_id", "name", "aliases", "price", "available", "stock_qty", "description"],
-    "PrivateList": ["phone"],
-    "Dashboard": ["Metric", "Value"]
+Output JSON Format:
+{
+  "type": "order" | "payment" | "partial_payment" | "question" | "catalog_query" | "delivery_query" | "complaint" | "command" | "unknown",
+  "customer_name": string or null,
+  "items": [
+    {"name": string, "qty": number, "size": string or null, "color": string or null, "unit_price": number or null}
+  ],
+  "amount": number or null,
+  "upi_txn_id": string or null,
+  "linked_order_id": string or null,
+  "delivery_address": string or null,
+  "confidence": {
+    "overall": number between 0.0 and 1.0,
+    "items": number between 0.0 and 1.0,
+    "amount": number between 0.0 and 1.0
+  },
+  "reply_needed": boolean,
+  "escalate_to_owner": boolean,
+  "escalation_reason": string or null
 }
 
-def get_service_account_path() -> str:
-    path = settings.GOOGLE_SERVICE_ACCOUNT_JSON
-    if not os.path.isabs(path):
-        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
-        path = os.path.join(base_dir, path.lstrip("./").lstrip(".\\"))
-    return path
+Rules for Classification:
+- "order": customer wants to buy or place an order (e.g. "2 kurti chahiye medium mein", "send 1 pink suit")
+- "payment": customer states they paid in full or sent payment proof (e.g. "599 bhej diya", "payment done via UPI")
+- "partial_payment": customer offers advance/token money (e.g. "200 abhi de rahi hoon, baaki delivery pe")
+- "catalog_query": asking about catalog, sizes, prices, what's in stock (e.g. "kurti ke kya sizes hain?", "price kya hai?")
+- "delivery_query": asking when order will arrive or tracking (e.g. "mera parcel kab aayega?")
+- "complaint": wrong size, damage, refund request, defect (e.g. "galat size aa gaya", "stitching kharab hai")
+- "command": owner command (e.g. "summary", "pending dues", "#private", "#resume")
+- "question": generic inquiry not covered above
+- "unknown": gibberish, casual chatter ("hahaha", "👍")
 
-def get_sheets_client() -> Optional[gspread.Spreadsheet]:
-    svc_path = get_service_account_path()
-    if not os.path.isfile(svc_path) or not settings.GOOGLE_SHEET_ID:
-        logger.warning(f"Google service account or Sheet ID not configured. Path: {svc_path}")
-        return None
+Escalation Rules:
+- Set "escalate_to_owner": true if:
+  1. confidence.overall < 0.75
+  2. type is "complaint" or "partial_payment"
+  3. Custom price, discount requested, or unclear request
+- Provide a concise "escalation_reason" in Hinglish/English.
+- Return ONLY the JSON object. Do not enclose in markdown backticks.
+ """
 
-    try:
-        creds = Credentials.from_service_account_file(svc_path, scopes=SCOPES)
-        client = gspread.authorize(creds)
-        spreadsheet = client.open_by_key(settings.GOOGLE_SHEET_ID)
-        return spreadsheet
-    except Exception as e:
-        logger.error(f"Failed to connect to Google Sheets: {e}")
-        return None
-
-
-def init_spreadsheet_tabs():
+async def analyze_message(
+    raw_text: str,
+    customer_phone: str,
+    message_id: str = "",
+    timestamp: str = "",
+    media_type: str = "text",
+    catalog_summary: str = ""
+) -> ExtractedMessage:
     """
-    Ensures all 6 tabs and standard headers exist in the Google Sheet.
-    If a tab is missing, it creates it and sets the headers.
+    Extracts structured intent, items, amount, and confidence from customer message using Gemini.
     """
-    doc = get_sheets_client()
-    if not doc:
-        return
+    if not timestamp:
+        timestamp = datetime.now().isoformat()
 
-    try:
-        existing_worksheets = {ws.title: ws for ws in doc.worksheets()}
-
-        for tab_name, headers in TAB_HEADERS.items():
-            if tab_name not in existing_worksheets:
-                logger.info(f"Creating missing Google Sheet tab: {tab_name}")
-                ws = doc.add_worksheet(title=tab_name, rows=100, cols=len(headers) + 2)
-                ws.append_row(headers)
-            else:
-                ws = existing_worksheets[tab_name]
-                rows = ws.get_all_values()
-                if not rows:
-                    ws.append_row(headers)
-
-        # Populate sample catalog if Catalog tab only has headers
-        catalog_ws = doc.worksheet("Catalog")
-        if len(catalog_ws.get_all_values()) <= 1:
-            catalog_ws.append_rows([
-                ["PROD-001", "Cotton Anarkali Kurti", "kurti, kurta, pink kurti, anarkali", 599, "yes", 50, "Pink pure cotton flared anarkali kurti (Sizes: S, M, L, XL)"],
-                ["PROD-002", "Chanderi Silk Suit Set", "suit, silk suit, salwar suit, set", 1299, "yes", 25, "Chanderi silk embroidered 3-piece suit with dupatta (Sizes: M, L, XL)"],
-                ["PROD-003", "Straight Office Kurti", "office kurti, daily kurti, blue kurti", 450, "yes", 40, "Comfortable breathable daily wear straight kurti (Sizes: S, M, L, XL, XXL)"]
-            ])
-            logger.info("Populated default sample catalog items.")
-
-    except Exception as e:
-        logger.error(f"Error initializing Google Sheet tabs: {e}")
-
-
-def add_or_update_customer(phone: str, name: Optional[str] = None, status: str = "active"):
-    doc = get_sheets_client()
-    if not doc:
-        return
-
-    try:
-        ws = doc.worksheet("Customers")
-        records = ws.get_all_records()
-        now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        # Check if customer already exists
-        for idx, row in enumerate(records, start=2): # start=2 accounting for 1-based index and header
-            if str(row.get("phone", "")).strip() == str(phone).strip():
-                # Update last seen and name if newly discovered
-                ws.update_cell(idx, 4, now_iso)
-                if name and not row.get("name"):
-                    ws.update_cell(idx, 2, name)
-                return
-
-        # New Customer
-        ws.append_row([
-            str(phone),
-            name or "",
-            status,
-            now_iso,
-            f"=SUMIF(Orders!B:B, A{len(records) + 2}, Orders!G:G)", # formula for total_due
-            now_iso
-        ], value_input_option="USER_ENTERED")
-        logger.info(f"Saved new customer {phone} to Google Sheet.")
-    except Exception as e:
-        logger.error(f"Error adding customer to Google Sheet: {e}")
-
-
-def add_order(extracted: ExtractedMessage) -> str:
-    """
-    Appends a new order row to the Orders tab.
-    Returns generated order_id.
-    """
-    doc = get_sheets_client()
-    if not doc:
-        return ""
-
-    try:
-        ws = doc.worksheet("Orders")
-        records = ws.get_all_values()
-        order_num = max(1, len(records))
-        order_id = f"ORD-{order_num:03d}"
-
-        items_json_str = json.dumps([it.model_dump() for it in extracted.items])
-        items_readable = extracted.items_readable()
-        amount = extracted.amount or 0.0
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        row_idx = len(records) + 1
-
-        # amount_due formula: = amount - amount_paid
-        due_formula = f"=E{row_idx}-F{row_idx}"
-
-        ws.append_row([
-            order_id,
-            extracted.customer_phone,
-            items_json_str,
-            items_readable,
-            amount,
-            0.0, # initial amount_paid
-            due_formula,
-            extracted.delivery_address or "",
-            "pending",
-            now_str,
-            now_str
-        ], value_input_option="USER_ENTERED")
-
-        logger.info(f"Recorded Order {order_id} for {extracted.customer_phone} in Google Sheets.")
-        return order_id
-    except Exception as e:
-        logger.error(f"Error adding order to Google Sheet: {e}")
-        return ""
-
-
-def add_payment(extracted: ExtractedMessage) -> str:
-    """
-    Appends a payment row to the Payments tab.
-    Returns generated payment_id.
-    """
-    doc = get_sheets_client()
-    if not doc:
-        return ""
-
-    try:
-        ws = doc.worksheet("Payments")
-        payment_id = f"PAY-{uuid.uuid4().hex[:6].upper()}"
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        verified_status = "yes" if extracted.confidence.amount >= 0.8 else "pending"
-
-        ws.append_row([
-            payment_id,
-            extracted.linked_order_id or "",
-            extracted.customer_phone,
-            extracted.amount or 0.0,
-            "upi",
-            extracted.upi_txn_id or "",
-            "", # screenshot_url placeholder
-            verified_status,
-            now_str
-        ])
-
-        logger.info(f"Recorded Payment {payment_id} for {extracted.customer_phone} in Google Sheets.")
-        return payment_id
-    except Exception as e:
-        logger.error(f"Error adding payment to Google Sheet: {e}")
-        return ""
-
-
-def get_catalog() -> List[Dict[str, Any]]:
-    """
-    Reads all products currently defined in the Catalog tab.
-    """
-    doc = get_sheets_client()
-    if not doc:
-        return []
-
-    try:
-        ws = doc.worksheet("Catalog")
-        return ws.get_all_records()
-    except Exception as e:
-        logger.error(f"Error fetching catalog from Google Sheet: {e}")
-        return []
-
-
-def is_in_privatelist(phone: str) -> bool:
-    """
-    Checks if phone number is listed in PrivateList tab.
-    """
-    doc = get_sheets_client()
-    if not doc:
-        return False
-
-    try:
-        ws = doc.worksheet("PrivateList")
-        phones = ws.col_values(1)
-        clean_target = phone.replace("+", "").strip()
-        return any(p.replace("+", "").strip() == clean_target for p in phones[1:]) # skip header
-    except Exception as e:
-        logger.error(f"Error checking PrivateList: {e}")
-        return False
-
-def get_store_summary() -> str:
-    """
-    Computes a quick summary from the Orders tab for the store owner.
-    """
-    doc = get_sheets_client()
-    if not doc:
-        return "Unable to access Google Sheets right now."
-
-    try:
-        ws = doc.worksheet("Orders")
-        records = ws.get_all_records()
-
-        total_orders = len(records)
-        pending_orders = sum(1 for r in records if str(r.get("status", "")).lower() == "pending")
-        paid_orders = sum(1 for r in records if str(r.get("status", "")).lower() == "paid")
-        
-        total_sales = 0.0
-        for r in records:
-            try:
-                total_sales += float(r.get("amount", 0) or 0)
-            except (ValueError, TypeError):
-                pass
-
-        return (
-            "📊 *Munim AI — Store Summary*\n"
-            f"• Total Orders: {total_orders}\n"
-            f"• Pending Dues/Orders: {pending_orders}\n"
-            f"• Completed/Paid: {paid_orders}\n"
-            f"• Total Sales Volume: ₹{total_sales:.2f}\n\n"
-            "View full records in your Google Sheet."
+    # Fast-path for empty or trivial inputs
+    clean_text = raw_text.strip()
+    if not clean_text or clean_text.lower() in ["hi", "hello", "hey", "namaste"]:
+        return ExtractedMessage(
+            message_id=message_id,
+            timestamp=timestamp,
+            media_type=media_type,
+            type="question" if clean_text else "unknown",
+            customer_phone=customer_phone,
+            raw_text=raw_text,
+            confidence=ConfidenceScore(overall=1.0, items=1.0, amount=1.0),
+            reply_needed=True,
+            escalate_to_owner=False
         )
-    except Exception as e:
-        logger.error(f"Error computing store summary: {e}")
-        return "Error fetching store summary from sheet."
+
+    user_prompt = f"""
+Customer Phone: {customer_phone}
+Media Type: {media_type}
+Message: "{clean_text}"
+"""
+    if catalog_summary:
+        user_prompt += f"\nStore Catalog Context:\n{catalog_summary}\n"
+
+    candidate_models = [settings.GEMINI_MODEL, "gemini-3.1-flash-lite", "gemini-2.5-pro"]
+    
+    for model_name in candidate_models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={settings.GEMINI_API_KEY}"
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": SYSTEM_PROMPT + "\n\n" + user_prompt}
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json"
+            }
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    raw_json = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    parsed = json.loads(raw_json)
+
+                    # Build items list
+                    items = [
+                        OrderItem(
+                            name=it.get("name", "Item"),
+                            qty=int(it.get("qty", 1)),
+                            size=it.get("size"),
+                            color=it.get("color"),
+                            unit_price=float(it["unit_price"]) if it.get("unit_price") is not None else None
+                        )
+                        for it in parsed.get("items", [])
+                    ]
+
+                    conf_dict = parsed.get("confidence", {})
+                    confidence = ConfidenceScore(
+                        overall=float(conf_dict.get("overall", 0.9)),
+                        items=float(conf_dict.get("items", 0.9)),
+                        amount=float(conf_dict.get("amount", 0.9))
+                    )
+
+                    escalate = parsed.get("escalate_to_owner", False)
+                    if confidence.overall < 0.75 or parsed.get("type") in ["complaint", "partial_payment"]:
+                        escalate = True
+
+                    return ExtractedMessage(
+                        message_id=message_id,
+                        timestamp=timestamp,
+                        media_type=media_type,
+                        type=parsed.get("type", "unknown"),
+                        customer_phone=customer_phone,
+                        customer_name=parsed.get("customer_name"),
+                        items=items,
+                        amount=float(parsed["amount"]) if parsed.get("amount") is not None else None,
+                        upi_txn_id=parsed.get("upi_txn_id"),
+                        linked_order_id=parsed.get("linked_order_id"),
+                        delivery_address=parsed.get("delivery_address"),
+                        raw_text=raw_text,
+                        confidence=confidence,
+                        reply_needed=parsed.get("reply_needed", True),
+                        escalate_to_owner=escalate,
+                        escalation_reason=parsed.get("escalation_reason")
+                    )
+                else:
+                    logger.warning(f"Gemini API ({model_name}) returned status {resp.status_code}, trying fallback model if available...")
+        except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError) as e:
+            logger.warning(f"Error querying Gemini model {model_name}: {e}")
+
+    # Fallback if Gemini request or JSON parse fails
+    return ExtractedMessage(
+        message_id=message_id,
+        timestamp=timestamp,
+        media_type=media_type,
+        type="unknown",
+        customer_phone=customer_phone,
+        raw_text=raw_text,
+        confidence=ConfidenceScore(overall=0.5, items=0.5, amount=0.5),
+        reply_needed=True,
+        escalate_to_owner=True,
+        escalation_reason="AI extraction failed or timed out; manual owner review required."
+    )
+
+
+def generate_smart_reply(extracted: ExtractedMessage, catalog: List[Dict[str, Any]] = None) -> str:
+    """
+    Generates an automated, friendly Hinglish reply matching Indian small seller communication.
+    """
+    msg_type = extracted.type
+    name = extracted.customer_name or "Ji"
+
+    if msg_type == "order":
+        items_str = extracted.items_readable() or "aapka order"
+        amt_str = f" Total amount: ₹{int(extracted.amount)}." if extracted.amount else ""
+        return (
+            f"Namaste {name}! 🙏\n"
+            f"Aapka order note kar liya hai: {items_str}.{amt_str}\n"
+            f"Kripya apna delivery address bhej dijiye aur payment UPI se confirm karein."
+        )
+
+    elif msg_type == "payment":
+        amt_str = f"₹{int(extracted.amount)} " if extracted.amount else ""
+        return (
+            f"Dhanyawaad {name}! 🙏\n"
+            f"Aapki {amt_str}payment record kar li gayi hai. "
+            f"Aapka parcel jald pack karke dispatch karenge."
+        )
+
+    elif msg_type == "partial_payment":
+        amt_str = f"₹{int(extracted.amount)} " if extracted.amount else ""
+        return (
+            f"Namaste! 🙏\n"
+            f"Aapki {amt_str}advance payment note kar li hai. "
+            f"Owner jald aapse baaki balance aur delivery confirm karenge."
+        )
+
+    elif msg_type == "catalog_query":
+        if catalog:
+            items_list = []
+            for c in catalog[:5]:
+                avail = "Available" if str(c.get("available", "yes")).lower() in ["yes", "true", "1"] else "Out of stock"
+                items_list.append(f"• {c.get('name')}: ₹{c.get('price')} ({avail})")
+            catalog_text = "\n".join(items_list)
+            return (
+                f"Namaste! 🙏\n"
+                f"Hamare paas ye collection available hai:\n\n{catalog_text}\n\n"
+                f"Aapko kaunsa piece chahiye? Size bata dijiye!"
+            )
+        return "Namaste! Hamare paas premium kurtis aur ethnic wear available hai. Kaunsa size ya color chahiye aapko?"
+
+    elif msg_type == "delivery_query":
+        return (
+            f"Namaste {name}! 🙏\n"
+            f"Aapka order processing mein hai. Hum jald aapko dispatch aur tracking details share karenge."
+        )
+
+    elif msg_type == "complaint" or extracted.escalate_to_owner:
+        return (
+            f"Namaste {name}. 🙏\n"
+            f"Aapka message note kar liya hai. Humare store owner jald aapse personally connect karenge."
+        )
+
+    else:
+        return (
+            "Namaste! 🙏 Munim AI Store Assistant mein aapka swagat hai.\n"
+            "Aap order place kar sakte hain, collection dekh sakte hain ya payment proof bhej sakte hain."
+        )
+

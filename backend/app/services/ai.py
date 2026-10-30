@@ -1,244 +1,186 @@
-import json
 import logging
-import httpx
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from fastapi import APIRouter, Request, Query, Response, status
 
 from backend.app.core.config import settings
-from backend.app.models.schemas import ExtractedMessage, OrderItem, ConfidenceScore
+from backend.app.services.db import is_duplicate_message, record_processed_message
+from backend.app.services.whatsapp import send_whatsapp_message
+from backend.app.services.ai import analyze_message, generate_smart_reply
+from backend.app.services.sheets import (
+    add_or_update_customer,
+    add_order,
+    add_payment,
+    get_catalog,
+    get_store_summary
+)
+from backend.app.utils.privacy import check_privacy
 
 logger = logging.getLogger(__name__)
+router = APIRouter()
 
-SYSTEM_PROMPT = """
-You are 'Munim AI', an expert business assistant and accountant for small Indian home sellers (e.g., kurti/clothing, bakery, jewellery).
-Your job is to read customer messages (in English, Hindi, or Hinglish) and return a strictly structured JSON object.
-
-Output JSON Format:
-{
-  "type": "order" | "payment" | "partial_payment" | "question" | "catalog_query" | "delivery_query" | "complaint" | "command" | "unknown",
-  "customer_name": string or null,
-  "items": [
-    {"name": string, "qty": number, "size": string or null, "color": string or null, "unit_price": number or null}
-  ],
-  "amount": number or null,
-  "upi_txn_id": string or null,
-  "linked_order_id": string or null,
-  "delivery_address": string or null,
-  "confidence": {
-    "overall": number between 0.0 and 1.0,
-    "items": number between 0.0 and 1.0,
-    "amount": number between 0.0 and 1.0
-  },
-  "reply_needed": boolean,
-  "escalate_to_owner": boolean,
-  "escalation_reason": string or null
-}
-
-Rules for Classification:
-- "order": customer wants to buy or place an order (e.g. "2 kurti chahiye medium mein", "send 1 pink suit")
-- "payment": customer states they paid in full or sent payment proof (e.g. "599 bhej diya", "payment done via UPI")
-- "partial_payment": customer offers advance/token money (e.g. "200 abhi de rahi hoon, baaki delivery pe")
-- "catalog_query": asking about catalog, sizes, prices, what's in stock (e.g. "kurti ke kya sizes hain?", "price kya hai?")
-- "delivery_query": asking when order will arrive or tracking (e.g. "mera parcel kab aayega?")
-- "complaint": wrong size, damage, refund request, defect (e.g. "galat size aa gaya", "stitching kharab hai")
-- "command": owner command (e.g. "summary", "pending dues", "#private", "#resume")
-- "question": generic inquiry not covered above
-- "unknown": gibberish, casual chatter ("hahaha", "👍")
-
-Escalation Rules:
-- Set "escalate_to_owner": true if:
-  1. confidence.overall < 0.75
-  2. type is "complaint" or "partial_payment"
-  3. Custom price, discount requested, or unclear request
-  Provide a concise "escalation_reason" in Hinglish/English.
-- Return ONLY the JSON object. Do not enclose in markdown backticks.
-"""
-
-async def analyze_message(
-    raw_text: str,
-    customer_phone: str,
-    message_id: str = "",
-    timestamp: str = "",
-    media_type: str = "text",
-    catalog_summary: str = ""
-) -> ExtractedMessage:
+@router.get("/webhook")
+async def verify_webhook(
+    hub_mode: str = Query(None, alias="hub.mode"),
+    hub_challenge: str = Query(None, alias="hub.challenge"),
+    hub_verify_token: str = Query(None, alias="hub.verify_token")
+):
     """
-    Extracts structured intent, items, amount, and confidence from customer message using Gemini.
+    Meta Webhook Verification Handshake (GET).
     """
-    if not timestamp:
-        timestamp = datetime.now().isoformat()
-
-    # Fast-path for empty or trivial inputs
-    clean_text = raw_text.strip()
-    if not clean_text or clean_text.lower() in ["hi", "hello", "hey", "namaste"]:
-        return ExtractedMessage(
-            message_id=message_id,
-            timestamp=timestamp,
-            media_type=media_type,
-            type="question" if clean_text else "unknown",
-            customer_phone=customer_phone,
-            raw_text=raw_text,
-            confidence=ConfidenceScore(overall=1.0, items=1.0, amount=1.0),
-            reply_needed=True,
-            escalate_to_owner=False
-        )
-
-    user_prompt = f"""
-Customer Phone: {customer_phone}
-Media Type: {media_type}
-Message: "{clean_text}"
-"""
-    if catalog_summary:
-        user_prompt += f"\nStore Catalog Context:\n{catalog_summary}\n"
-
-    candidate_models = [settings.GEMINI_MODEL, "gemini-3.1-flash-lite", "gemini-2.5-pro"]
+    if hub_mode == "subscribe" and hub_verify_token == settings.WHATSAPP_VERIFY_TOKEN:
+        logger.info("Webhook verification handshake successful!")
+        return Response(content=hub_challenge, media_type="text/plain", status_code=status.HTTP_200_OK)
     
-    for model_name in candidate_models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={settings.GEMINI_API_KEY}"
-        payload = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {"text": SYSTEM_PROMPT + "\n\n" + user_prompt}
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.1,
-                "responseMimeType": "application/json"
-            }
-        }
+    logger.warning(f"Webhook verification failed. Token provided: {hub_verify_token}")
+    return Response(content="Verification token mismatch", status_code=status.HTTP_403_FORBIDDEN)
 
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
-                if resp.status_code == 200:
-                    data = resp.json()
-                    raw_json = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    parsed = json.loads(raw_json)
 
-                    # Build items list
-                    items = [
-                        OrderItem(
-                            name=it.get("name", "Item"),
-                            qty=int(it.get("qty", 1)),
-                            size=it.get("size"),
-                            color=it.get("color"),
-                            unit_price=float(it["unit_price"]) if it.get("unit_price") is not None else None
-                        )
-                        for it in parsed.get("items", [])
-                    ]
+@router.post("/webhook")
+async def handle_webhook(request: Request):
+    """
+    Full Munim AI Webhook Pipeline (POST):
+    1. Deduplication check
+    2. Privacy filtering (#private / #resume / PrivateList)
+    3. Owner command interception (summary, dues)
+    4. AI Multimodal extraction (Gemini)
+    5. Google Sheets auto-update (Customers, Orders, Payments)
+    6. Owner escalation on low confidence / complaints
+    7. Customer auto-reply
+    """
+    try:
+        data = await request.json()
+    except (TypeError, ValueError) as e:
+        logger.error(f"Error parsing webhook JSON: {e}")
+        return Response(content="Invalid JSON", status_code=status.HTTP_400_BAD_REQUEST)
 
-                    conf_dict = parsed.get("confidence", {})
-                    confidence = ConfidenceScore(
-                        overall=float(conf_dict.get("overall", 0.9)),
-                        items=float(conf_dict.get("items", 0.9)),
-                        amount=float(conf_dict.get("amount", 0.9))
-                    )
+    entries = data.get("entry", [])
+    for entry in entries:
+        changes = entry.get("changes", [])
+        for change in changes:
+            value = change.get("value", {})
+            
+            # Skip status callbacks (sent, delivered, read)
+            if "statuses" in value and "messages" not in value:
+                continue
 
-                    escalate = parsed.get("escalate_to_owner", False)
-                    if confidence.overall < 0.75 or parsed.get("type") in ["complaint", "partial_payment"]:
-                        escalate = True
+            # Extract profile name if present
+            contacts = value.get("contacts", [])
+            contact_name = contacts[0].get("profile", {}).get("name") if contacts else None
 
-                    return ExtractedMessage(
-                        message_id=message_id,
-                        timestamp=timestamp,
-                        media_type=media_type,
-                        type=parsed.get("type", "unknown"),
-                        customer_phone=customer_phone,
-                        customer_name=parsed.get("customer_name"),
-                        items=items,
-                        amount=float(parsed["amount"]) if parsed.get("amount") is not None else None,
-                        upi_txn_id=parsed.get("upi_txn_id"),
-                        linked_order_id=parsed.get("linked_order_id"),
-                        delivery_address=parsed.get("delivery_address"),
-                        raw_text=raw_text,
-                        confidence=confidence,
-                        reply_needed=parsed.get("reply_needed", True),
-                        escalate_to_owner=escalate,
-                        escalation_reason=parsed.get("escalation_reason")
-                    )
+            messages = value.get("messages", [])
+            for msg in messages:
+                message_id = msg.get("id")
+                sender_phone = msg.get("from", "")
+                msg_type = msg.get("type", "unknown")
+                msg_timestamp = msg.get("timestamp")
+
+                # Format ISO timestamp
+                if msg_timestamp:
+                    try:
+                        timestamp_iso = datetime.fromtimestamp(int(msg_timestamp)).isoformat()
+                    except (TypeError, ValueError, OverflowError):
+                        timestamp_iso = datetime.now().isoformat()
                 else:
-                    logger.warning(f"Gemini API ({model_name}) returned status {resp.status_code}, trying fallback model if available...")
-        except Exception as e:
-            logger.warning(f"Error querying Gemini model {model_name}: {e}")
+                    timestamp_iso = datetime.now().isoformat()
 
-    # Fallback if Gemini request or JSON parse fails
-    return ExtractedMessage(
-        message_id=message_id,
-        timestamp=timestamp,
-        media_type=media_type,
-        type="unknown",
-        customer_phone=customer_phone,
-        raw_text=raw_text,
-        confidence=ConfidenceScore(overall=0.5, items=0.5, amount=0.5),
-        reply_needed=True,
-        escalate_to_owner=True,
-        escalation_reason="AI extraction failed or timed out; manual owner review required."
-    )
+                # Deduplication check
+                if is_duplicate_message(message_id):
+                    logger.info(f"Duplicate message ignored: {message_id}")
+                    continue
 
+                raw_text = ""
+                if msg_type == "text":
+                    raw_text = msg.get("text", {}).get("body", "")
+                elif msg_type in ["audio", "voice"]:
+                    raw_text = "[Voice Note / Audio Message]"
+                elif msg_type == "image":
+                    raw_text = "[Image Message / UPI Screenshot]"
+                else:
+                    raw_text = f"[{msg_type} message]"
 
-def generate_smart_reply(extracted: ExtractedMessage, catalog: List[Dict[str, Any]] = None) -> str:
-    """
-    Generates an automated, friendly Hinglish reply matching Indian small seller communication.
-    """
-    msg_type = extracted.type
-    name = extracted.customer_name or "Ji"
+                # Record message to prevent re-processing on webhook retries
+                record_processed_message(
+                    message_id=message_id,
+                    sender_phone=sender_phone,
+                    media_type=msg_type,
+                    raw_text=raw_text
+                )
 
-    if msg_type == "order":
-        items_str = extracted.items_readable() or "aapka order"
-        amt_str = f" Total amount: ₹{int(extracted.amount)}." if extracted.amount else ""
-        return (
-            f"Namaste {name}! 🙏\n"
-            f"Aapka order note kar liya hai: {items_str}.{amt_str}\n"
-            f"Kripya apna delivery address bhej dijiye aur payment UPI se confirm karein."
-        )
+                logger.info(f"Processing incoming message from {sender_phone} ({msg_type}): {raw_text}")
 
-    elif msg_type == "payment":
-        amt_str = f"₹{int(extracted.amount)} " if extracted.amount else ""
-        return (
-            f"Dhanyawaad {name}! 🙏\n"
-            f"Aapki {amt_str}payment record kar li gayi hai. "
-            f"Aapka parcel jald pack karke dispatch karenge."
-        )
+                # 1. Privacy Filter Check
+                is_private, privacy_msg = check_privacy(sender_phone, raw_text)
+                if is_private:
+                    logger.info(f"Private chat active for {sender_phone}. Bypassing AI processing and storage.")
+                    # Acknowledge if this was the triggering #private command
+                    if raw_text.strip().lower().startswith("#private"):
+                        await send_whatsapp_message(sender_phone, "🔒 Munim AI assistant paused for this chat. Type #resume to restart.")
+                    continue
 
-    elif msg_type == "partial_payment":
-        amt_str = f"₹{int(extracted.amount)} " if extracted.amount else ""
-        return (
-            f"Namaste! 🙏\n"
-            f"Aapki {amt_str}advance payment note kar li hai. "
-            f"Owner jald aapse baaki balance aur delivery confirm karenge."
-        )
+                if raw_text.strip().lower().startswith("#resume"):
+                    await send_whatsapp_message(sender_phone, "🔓 Munim AI assistant resumed for this chat.")
+                    continue
 
-    elif msg_type == "catalog_query":
-        if catalog:
-            items_list = []
-            for c in catalog[:5]:
-                avail = "Available" if str(c.get("available", "yes")).lower() in ["yes", "true", "1"] else "Out of stock"
-                items_list.append(f"• {c.get('name')}: ₹{c.get('price')} ({avail})")
-            catalog_text = "\n".join(items_list)
-            return (
-                f"Namaste! 🙏\n"
-                f"Hamare paas ye collection available hai:\n\n{catalog_text}\n\n"
-                f"Aapko kaunsa piece chahiye? Size bata dijiye!"
-            )
-        return "Namaste! Hamare paas premium kurtis aur ethnic wear available hai. Kaunsa size ya color chahiye aapko?"
+                # 2. Check for Owner Commands
+                clean_sender = sender_phone.replace("+", "").strip()
+                clean_owner = settings.OWNER_WHATSAPP_NUMBER.replace("+", "").strip()
+                lower_text = raw_text.strip().lower()
 
-    elif msg_type == "delivery_query":
-        return (
-            f"Namaste {name}! 🙏\n"
-            f"Aapka order processing mein hai. Hum jald aapko dispatch aur tracking details share karenge."
-        )
+                if clean_sender and clean_sender == clean_owner and lower_text in ["summary", "pending dues", "dues", "hisaab"]:
+                    summary_text = get_store_summary()
+                    await send_whatsapp_message(sender_phone, summary_text)
+                    continue
 
-    elif msg_type == "complaint" or extracted.escalate_to_owner:
-        return (
-            f"Namaste {name}. 🙏\n"
-            f"Aapka message note kar liya hai. Humare store owner jald aapse personally connect karenge."
-        )
+                # 3. AI Extraction (Gemini)
+                catalog = get_catalog()
+                catalog_summary = "\n".join([
+                    f"- {c.get('name')}: ₹{c.get('price')} (Sizes/Details: {c.get('description', '')})"
+                    for c in catalog
+                ])
 
-    else:
-        return (
-            "Namaste! 🙏 Munim AI Store Assistant mein aapka swagat hai.\n"
-            "Aap order place kar sakte hain, collection dekh sakte hain ya payment proof bhej sakte hain."
-        )
+                extracted = await analyze_message(
+                    raw_text=raw_text,
+                    customer_phone=sender_phone,
+                    message_id=message_id,
+                    timestamp=timestamp_iso,
+                    media_type=msg_type,
+                    catalog_summary=catalog_summary
+                )
+
+                logger.info(f"Extracted intent for {sender_phone}: {extracted.type} (confidence: {extracted.confidence.overall})")
+
+                # 4. Update Google Sheets (Customers, Orders, Payments)
+                customer_display_name = extracted.customer_name or contact_name
+                add_or_update_customer(
+                    phone=sender_phone,
+                    name=customer_display_name,
+                    status="active"
+                )
+
+                if extracted.type == "order":
+                    add_order(extracted)
+
+                elif extracted.type in ["payment", "partial_payment"]:
+                    add_payment(extracted)
+
+                # 5. Owner Escalation Check
+                if extracted.escalate_to_owner and clean_owner:
+                    reason = extracted.escalation_reason or "Customer inquiry requires manual attention."
+                    escalation_alert = (
+                        "🚨 *Munim AI Alert — Attention Needed*\n"
+                        f"• Customer: +{sender_phone}\n"
+                        f"• Type: {extracted.type}\n"
+                        f"• Reason: {reason}\n"
+                        f"• Message: \"{raw_text}\""
+                    )
+                    await send_whatsapp_message(clean_owner, escalation_alert)
+                    logger.info(f"Escalated message to owner ({clean_owner}).")
+
+                # 6. Customer Auto-Reply
+                if extracted.reply_needed:
+                    reply_text = generate_smart_reply(extracted, catalog)
+                    await send_whatsapp_message(sender_phone, reply_text)
+                    logger.info(f"Replied to customer {sender_phone}: {reply_text[:60]}...")
+
+    return {"status": "success"}
+
